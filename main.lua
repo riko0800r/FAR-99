@@ -1,3 +1,4 @@
+
 local bit32 = require("libs/bit32")
 
 local vm = {
@@ -58,10 +59,10 @@ end
 
 function vm.init_palette()
     local colors = {
-        {0, 0, 0}, {29, 43, 83}, {126, 37, 83}, {0, 135, 81},
-        {171, 82, 54}, {95, 87, 79}, {194, 195, 199}, {255, 241, 232},
-        {255, 0, 77}, {255, 163, 0}, {255, 236, 39}, {0, 228, 54},
-        {41, 173, 255}, {131, 118, 156}, {255, 119, 168}, {255, 204, 170}
+        {0, 0, 0}, {7, 54, 66}, {88, 110, 117}, {101, 123, 131},
+        {131, 148, 150}, {147, 161, 161}, {238, 232, 213}, {253, 246, 227},
+        {181, 137, 0}, {203, 75, 22}, {220, 50, 47}, {211, 54, 130},
+        {108, 113, 196}, {38, 139, 210}, {42, 161, 152}, {133, 153, 0}
     }
     
     for i = 0, 15 do
@@ -172,6 +173,51 @@ function vm.line(x1, y1, x2, y2)
     end
 end
 
+function vm.load_spr(sprite_id,image_path)
+    local function find_color(r,g,b)
+      local min_dist   = math.huge
+      local best_index = 0
+        
+      for i=0,15 do
+        local color = vm.palette[i]
+        local dr    = r - color[1]
+        local dg    = g - color[2]
+        local db    = b - color[3]
+          
+        local dist = dr*dr + dg*dg +db*db
+          
+        if dist < min_dist then
+          min_dist = dist
+          best_index = i
+        end
+      end
+      return best_index
+    end
+    local success, img_data = pcall(love.image.newImageData,image_path)
+    if not success then
+      print("ERRO: erro ao carregar imagem: ", img_data)
+      return
+    end
+    
+    if img_data:getWidth() ~= 16 or img_data:getHeight() ~= 16 then
+      print("ERRO: A imagem deve ser 16x16 pixels!")
+      return
+    end
+    
+    local base_addr = vm.ADDR_SPRITES + sprite_id * 256
+    for y = 0,15 do
+      for x = 0,15 do
+        local r,g,b,a = img_data:getPixel(x,y)
+        if a < 0.5 then
+          vm.poke(base_addr + y * 16 + x, 0)
+        else
+          local color_index = find_color(r,g,a)
+          vm.poke(base_addr + y * 16 + x, color_index)
+        end
+      end
+    end
+end
+
 function vm.rect(x, y, w, h, filled)
     if filled then
         for j = y, y + h - 1 do
@@ -265,7 +311,7 @@ end
 
 -- API para jogos
 function vm.expose_api()
-    return {
+    api = {
         cls = vm.cls,
         px = vm.px,
         spr = vm.spr,
@@ -290,15 +336,53 @@ function vm.expose_api()
         poke = vm.poke,
         btn = function(key)
             return (bit32.band(vm.input_state, vm.key_map[key] or 0)) ~= 0
-        end
+        end,
+        load_spr = vm.load_spr
     }
+    api.love = {
+        load = love.load,
+        update = love.update,
+        draw = love.draw
+    }
+    
+    return api
 end
 
 -- Funções principais do LÖVE
 function love.load()
     vm.init()
-    local game = love.filesystem.load("game.lua")
-    if game then setfenv(game, vm.expose_api()) end
+    local game_chunk,error_msg = love.filesystem.load("game.lua")
+    
+    if not game_chunk then
+        error("Failed to load game.lua")
+    end
+    
+    local game_env = setmetatable({},{
+        __index = function(_,k)
+            return vm.expose_api()[k] or _G[k]
+        end,
+        __newindex = function(t,k,v)
+            rawset(t,k,v)
+        end
+    })
+    
+    setfenv(game_chunk,game_env)
+    
+    pcall(game_chunk)
+    
+    if game_env.load then
+        game_env.load()
+        vm.load = game_env.load()
+    end
+    
+    if game_env.update then
+       vm.update = game_env.update
+    end
+    
+    if game_env.update then
+       vm.draw = game_env.draw
+    end
+    
 end
 
 function love.update(dt)
