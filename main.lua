@@ -233,20 +233,23 @@ function vm.generate_waveform(channel)
 end
 
 function vm.update_audio(dt)
-    local samples_needed = vm.audio.source:getFreeBufferCount() * 4096
-    local sample_data = love.sound.newSoundData(samples_needed, vm.audio.sample_rate, 16, 1)
+    local free_buffers = vm.audio.source:getFreeBufferCount()
+    if free_buffers > 0 then
+      local samples_needed = vm.audio.source:getFreeBufferCount() * 4096
+      local sample_data = love.sound.newSoundData(samples_needed, vm.audio.sample_rate, 16, 1)
 
-    for i = 0, samples_needed - 1 do
-        local mixed = 0
-        for ch = 1, 8 do
-            local channel = vm.audio.channels[ch]
-            if channel.enabled then
-                mixed = mixed + (vm.generate_waveform(channel) * (channel.volume / 15))
-            end
-        end
-        sample_data:setSample(i, clamp(mixed * vm.audio.master_volume, -1, 1))
+      for i = 0, samples_needed - 1 do
+          local mixed = 0
+          for ch = 1, 8 do
+              local channel = vm.audio.channels[ch]
+              if channel.enabled then
+                  mixed = mixed + (vm.generate_waveform(channel) * (channel.volume / 15))
+              end
+          end
+          sample_data:setSample(i, clamp(mixed * vm.audio.master_volume, -1, 1))
+      end
+      vm.audio.source:queue(sample_data)
     end
-    vm.audio.source:queue(sample_data)
 end
 
 -- Input handling
