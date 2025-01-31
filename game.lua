@@ -1,5 +1,5 @@
 -- game.lua
-function love.load()
+function load()
     -- Carregar um sprite simples na memória (smiley)
     local sprite_addr = 0x4000  -- Endereço base dos sprites
     local smiley = {
@@ -68,21 +68,21 @@ function draw()
     spr(0, math.floor(player.x), math.floor(player.y))
     
     -- Desenhar borda colorida que muda com o tempo
-    color((math.floor(time*5) % 15) + 1)
-    rect(10, 10, 140, 100, false)
+    --color((math.floor(time*5) % 15) + 1)
+    --rect(10, 10, 140, 100, false)
     
     -- Desenhar linha animada
-    color(12)
-    line(20, 20, 20 + math.sin(time)*50, 20 + math.cos(time)*50)
+    --color(12)
+    --line(20, 20, 20 + math.sin(time)*50, 20 + math.cos(time)*50)
     
     -- Desenhar círculo pulsante
     color(9)
-    circ(80 + math.cos(time*2)*30, 60 + math.sin(time*2)*30, 10 + math.sin(time*5)*5)
+    circ(63,63,8)
     
     -- Texto simples usando pixels
-    color(15)
-    local text = "PIXEL CONSOLE"
+    
+    local text = ""
     for i = 1, #text do
-        px(40 + i*8, 100, (i + math.floor(time*4)) % 15)
+        px(40 + i*8, 100, (i + math.floor(time*16)) % 16)
     end
 end
