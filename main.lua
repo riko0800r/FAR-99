@@ -10,7 +10,8 @@ local vm = {
     ADDR_SPRITES = 0x4000,
     ADDR_FRAMEBUFFER = 0x8000,
     ADDR_INPUT = 0xFF00,
-    ADDR_AUDIO = 0xA000,
+    ADDR_SOUND_BANK = 0xC000,
+    ADDR_SOUND_CTRL = 0xFFF0,
     
     -- Componentes do sistema
     palette = {},
@@ -28,14 +29,15 @@ local vm = {
     
     -- Sistema de áudio
     audio = {
-        channels = {},
-        waveforms = {SQUARE = 0, TRIANGLE = 1, SAWTOOTH = 2, NOISE = 3},
-        sample_rate = 44100,
-        master_volume = 0.5,
-        noise_generator = 0,
-        source = nil
+      samples  = {},
+      music    = nil,
+      channels = 8,
+      sfx_volume   = 1.0,
+      music_volume = 1.0
     }
 }
+
+
 
 -- Funções utilitárias
 local function clamp(v, min, max)
@@ -47,7 +49,6 @@ function vm.init()
     vm.init_memory()
     vm.init_palette()
     vm.init_graphics()
-    vm.init_audio()
 end
 
 function vm.init_memory()
@@ -77,18 +78,24 @@ function vm.init_graphics()
     vm.screen:setFilter("nearest", "nearest")
 end
 
-function vm.init_audio()
-    for i = 1, 8 do
-        vm.audio.channels[i] = {
-            frequency = 0, volume = 0, waveform = 0,
-            duty = 0.5, enabled = false, phase = 0
-        }
-    end
-    vm.audio.source = love.audio.newQueueableSource(
-        vm.audio.sample_rate, 16, 1, 4096
-    )
-    vm.audio.source:play()
+
+-- =====================
+-- === MUSICA E SFX ====
+-- =====================
+
+
+function vm.load_sound(sound_id , file_path)
+  local sample = love.sound.newSoundData(file_path)
+  vm.audio.samples[sound_id] = sample
+  print("Som carregado ID : " .. sound_id)
 end
+
+function vm.load_music(music_id , file_path)
+  vm.audio.music = love.audio.newSource(file_path, "stream")
+  vm.audio.music:setLooping(true)
+  print("Musica carregada ID : " .. music_id)
+end
+
 
 -- Manipulação de memória
 function vm.peek(addr)
@@ -98,31 +105,46 @@ end
 function vm.poke(addr, value)
     value = bit32.band(value, 0xFF)
     
-    if addr >= vm.ADDR_AUDIO and addr < vm.ADDR_AUDIO + 0x80 then
-        vm.handle_audio_register(addr, value)
+    if addr >= vm.ADDR_SOUND_CTRL and addr < vm.ADDR_SOUND_CTRL + 0x0F then
+        local reg = addr - vm.ADDR_SOUND_CTRL
+        local channel = vm.peek(vm.ADDR_SOUND_CTRL + 0x03)
+        
+        if reg == 0x00 then
+            -- controle geral do som
+            local music_enable = bit32.band(value,0x01) ~= 0
+            local sfx_enable   = bit32.band(value,0x02) ~= 0
+            if vm.audio.music then
+                vm.audio.music:setVolume(music_enable and vm.audio.music or 0)
+            end
+            vm.audio.sfx_volume = sfx_enable and 1.0 or 0.0
+        end
+
+        if reg == 0x01 then
+            -- volume da Musica
+            vm.audio.music_volume = value / 255
+            if vm.audio.music then
+                vm.audio.music:setVolume(vm.sound.music_volume)
+            end
+        end
+
+        if reg == 0x02 then
+            -- volume do SFX
+            vm.audio.sfx_volume = value / 255
+        end
+
+        if reg == 0x04 then
+            -- executar comando
+            local sound_id = vm.peek(vm.ADDR_SOUND_CTRL + 0x05)
+            if value == 1 then
+                if vm.audio.samples[sound_id] then
+                    local source = love.audio.newSource(vm.audio.samples[sound_id],"static")
+                    source:setVolume(vm.audio.sfx_volume)
+                    source:play()
+                end
+            end
+        end
     else
         vm.mem[addr] = value
-    end
-end
-
-function vm.handle_audio_register(addr, value)
-    local channel_num = math.floor((addr - vm.ADDR_AUDIO) / 16) + 1
-    local register = (addr - vm.ADDR_AUDIO) % 16
-    
-    if channel_num < 1 or channel_num > 8 then return end
-    
-    local channel = vm.audio.channels[channel_num]
-    
-    if register == 0 then
-        channel.enabled = bit32.band(value, 0x80) ~= 0
-        channel.waveform = bit32.rshift(bit32.band(value, 0x60), 5)
-        channel.duty = ({0.125, 0.25, 0.5, 0.75})[bit32.rshift(bit32.band(value, 0x18), 3) + 1] or 0.5
-    elseif register == 1 then
-        channel.volume = bit32.band(value, 0x0F)
-    elseif register == 2 then
-        channel.frequency = bit32.bor(bit32.band(channel.frequency, 0xFF00), value)
-    elseif register == 3 then
-        channel.frequency = bit32.bor(bit32.lshift(value, 8), bit32.band(channel.frequency, 0x00FF))
     end
 end
 
@@ -257,47 +279,6 @@ function vm.circ(xc, yc, r)
     end
 end
 
--- Sistema de áudio
-function vm.generate_waveform(channel)
-    local phase_inc = channel.frequency / vm.audio.sample_rate
-    channel.phase = (channel.phase + phase_inc) % 1
-
-    if channel.waveform == vm.audio.waveforms.SQUARE then
-        return channel.phase < channel.duty and 1 or -1
-    elseif channel.waveform == vm.audio.waveforms.TRIANGLE then
-        return 2 * math.abs(2 * channel.phase - 1) - 1
-    elseif channel.waveform == vm.audio.waveforms.SAWTOOTH then
-        return 2 * channel.phase - 1
-    elseif channel.waveform == vm.audio.waveforms.NOISE then
-        vm.audio.noise_generator = bit32.bxor(
-            bit32.lshift(vm.audio.noise_generator, 1),
-            bit32.band(bit32.rshift(vm.audio.noise_generator, 7), 1) * 0x80
-        )
-        return (vm.audio.noise_generator / 255) * 2 - 1
-    end
-    return 0
-end
-
-function vm.update_audio(dt)
-    local free_buffers = vm.audio.source:getFreeBufferCount()
-    if free_buffers > 0 then
-      local samples_needed = vm.audio.source:getFreeBufferCount() * 4096
-      local sample_data = love.sound.newSoundData(samples_needed, vm.audio.sample_rate, 16, 1)
-
-      for i = 0, samples_needed - 1 do
-          local mixed = 0
-          for ch = 1, 8 do
-              local channel = vm.audio.channels[ch]
-              if channel.enabled then
-                  mixed = mixed + (vm.generate_waveform(channel) * (channel.volume / 15))
-              end
-          end
-          sample_data:setSample(i, clamp(mixed * vm.audio.master_volume, -1, 1))
-      end
-      vm.audio.source:queue(sample_data)
-    end
-end
-
 -- Input handling
 function love.keypressed(key)
     local mask = vm.key_map[key]
@@ -319,30 +300,39 @@ function vm.expose_api()
         rect = vm.rect,
         circ = vm.circ,
         color = function(c) vm.draw_color = bit32.band(c, 0x0F) end,
-        play_note = function(ch, freq, vol, wave)
-            if ch < 1 or ch > 8 then return end
-            local c = vm.audio.channels[ch]
-            c.frequency = freq
-            c.volume = vol or 15
-            c.waveform = wave or 0
-            c.enabled = true
-        end,
-        stop_note = function(ch)
-            if vm.audio.channels[ch] then
-                vm.audio.channels[ch].enabled = false
-            end
-        end,
         peek = vm.peek,
         poke = vm.poke,
         btn = function(key)
             return (bit32.band(vm.input_state, vm.key_map[key] or 0)) ~= 0
         end,
-        load_spr = vm.load_spr
+        load_spr = vm.load_spr,
+
+        -- som
+        load_sfx = vm.load_sound,
+        load_music = vm.load_music,
+        play_music = function ()
+            if vm.audio.music then
+                vm.audio.music:play()
+            end
+        end,
+        stop_music = function()
+            if vm.audio.music then
+                vm.audio.music:stop()
+            end
+        end,
+        play_sfx = function (sfx_id)
+            if vm.audio.samples[sfx_id] then
+                local src = love.audio.newSource(vm.audio.samples[sfx_id], "static")
+                src:setVolume(vm.audio.sfx_volume)
+                src:play()
+            end
+        end
     }
     api.love = {
         load = love.load,
         update = love.update,
-        draw = love.draw
+        draw = love.draw,
+        key_pressed = love.keypressed,
     }
     
     return api
@@ -382,16 +372,54 @@ function love.load()
     if game_env.update then
        vm.draw = game_env.draw
     end
-    
+  
+ shaderCode = [[
+      extern number time;
+      extern vec2 resolution;
+
+      vec4 effect(vec4 color, Image texture, vec2 texture_coords, vec2 screen_coords) {
+          // Coordenadas normalizadas
+          vec2 uv = screen_coords / resolution;
+
+          // Distorção de barril para simular curvatura
+          vec2 center = uv - 0.5;
+          float radius = length(center);
+          center *= 1.0 + 0.2 * radius * radius;
+          uv = center + 0.5;
+
+          // Verifica se está fora da tela (bordas escuras)
+          if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+              return vec4(0.0, 0.0, 0.0, 1.0);
+          }
+
+          // Amostra a textura original
+          vec4 texColor = Texel(texture, uv);
+
+          // Linhas de varredura horizontais
+          float scanline = sin(uv.y * resolution.y * 2.0) * 0.1 + 0.9;
+          texColor.rgb *= scanline;
+
+          // Tremulação de brilho
+          texColor.rgb *= 0.95 + 0.05 * sin(time * 2.0);
+
+          return texColor * color;
+      }
+  ]]
+  shader = love.graphics.newShader(shaderCode)
 end
+
+local time = 0
 
 function love.update(dt)
     vm.poke(vm.ADDR_INPUT, vm.input_state)
-    vm.update_audio(dt)
     if vm.update then vm.update(dt) end
+    time = time + dt
+    shader:send("time", time)
+    shader:send("resolution", {160*4, 120*4})
 end
 
 function love.draw()
+    love.graphics.setShader(shader)
     if vm.draw then vm.draw() end
     vm.pixels:mapPixel(function(x, y)
         local color = vm.peek(vm.ADDR_FRAMEBUFFER + y * vm.screen_width + x) % 16
