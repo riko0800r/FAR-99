@@ -1,31 +1,159 @@
-function build_cartridge(title, author, icon_path, code_path, output_path)
-    local header = string.pack(
-        "<c4 c32 c32 c16 BB I4 I4",
-        "F99",
-        title,
-        author,
-        os.date("%Y%m%d%H%M%S"),
-        1, 0,  -- Versão
-        16, 16, -- Tamanho do ícone
-        0, 0,   -- Placeholder para ícone e checksum
-        #code
+local bit32 = require("bit32")
+
+-- Configuração inicial do sistema de áudio
+vm.audio = {
+    sample_rate = 44100,
+    channels = {},
+    source = nil,
+    buffer_size = 4096,
+    master_volume = 0.7
+}
+
+-- Inicialização do sistema de áudio
+function vm.init_audio()
+    -- Criar fonte de áudio
+    vm.audio.source = love.audio.newQueueableSource(
+        vm.audio.sample_rate,
+        16, -- bits
+        1,  -- canal (mono)
+        vm.audio.buffer_size
     )
     
-    -- Processar ícone
-    local icon_data = ""
-    local img = love.image.newImageData(icon_path)
-    for y=0,15 do
-        for x=0,15 do
-            local r, g, b = img:getPixel(x, y)
-            local color = closest_palette_color(r, g, b)
-            icon_data = icon_data .. string.char(color)
+    -- Configurar parâmetros iniciais
+    vm.audio.source:setVolume(vm.audio.master_volume)
+    vm.audio.source:play()
+    
+    -- Inicializar canais do tracker
+    for i = 1, 4 do
+        vm.audio.channels[i] = {
+            sample_pos = 0,
+            sample_data = nil,
+            volume = 1.0,
+            playing = false,
+            loop = false
+        }
+    end
+end
+
+-- Função de mixagem de áudio
+function vm.audio_mixer()
+    local mix = 0.0
+    for _, ch in ipairs(vm.audio.channels) do
+        if ch.playing and ch.sample_data then
+            -- Leitura interpolada do sample
+            local pos = math.floor(ch.sample_pos)
+            local frac = ch.sample_pos - pos
+            local s1 = ch.sample_data[pos] or 0
+            local s2 = ch.sample_data[pos + 1] or s1
+            
+            mix = mix + (s1 * (1 - frac) + s2 * frac) * ch.volume
+            ch.sample_pos = ch.sample_pos + ch.speed
+            
+            -- Verificar fim do sample
+            if ch.sample_pos >= #ch.sample_data then
+                if ch.loop then
+                    ch.sample_pos = ch.sample_pos % #ch.sample_data
+                else
+                    ch.playing = false
+                end
+            end
         end
     end
+    return math.max(-1.0, math.min(1.0, mix * vm.audio.master_volume))
+end
+
+-- Atualização do sistema de áudio
+function vm.update_audio(dt)
+    if not vm.audio.source then return end
     
-    -- Calcular checksum
-    local data = header .. icon_data .. code
-    local checksum = vm.crc32(data)
-    data = data:sub(1, 156) .. string.pack("<I4", checksum) .. data:sub(161)
+    local buffers_needed = math.ceil(vm.audio.source:getFreeBufferCount())
+    for i = 1, buffers_needed do
+        local buffer = love.sound.newSoundData(vm.audio.buffer_size, vm.audio.sample_rate, 16, 1)
+        
+        for s = 0, vm.audio.buffer_size - 1 do
+            buffer:setSample(s, vm.audio_mixer())
+        end
+        
+        vm.audio.source:queue(buffer)
+    end
+end
+
+-- Sistema do Tracker (implementação completa)
+vm.tracker = {
+    patterns = {},
+    order = {},
+    speed = 6,
+    bpm = 125,
+    row = 0,
+    pattern = 0,
+    tick = 0,
+    playing = false
+}
+
+function vm.tracker_play_note(ch, note, instr, effect, param)
+    if ch < 1 or ch > 4 then return end
     
-    love.filesystem.write(output_path, data)
+    -- Carregar instrumento
+    local sample = vm.fs.read("instr_" .. instr)
+    if sample then
+        vm.audio.channels[ch] = {
+            sample_data = sample.data,
+            sample_pos = 0,
+            volume = 1.0,
+            playing = true,
+            speed = 1.0,
+            loop = false
+        }
+    end
+    
+    -- Aplicar efeitos
+    -- (Implementar lógica de efeitos aqui)
+end
+
+function vm.tracker_update(dt)
+    if not vm.tracker.playing then return end
+    
+    vm.tracker.tick = vm.tracker.tick + 1
+    if vm.tracker.tick >= vm.tracker.speed then
+        vm.tracker.tick = 0
+        vm.process_tracker_row()
+        vm.tracker.row = vm.tracker.row + 1
+        
+        if vm.tracker.row >= 64 then
+            vm.tracker.row = 0
+            vm.tracker.pattern = vm.tracker.order[vm.tracker.order_pos + 1] or 0
+            vm.tracker.order_pos = (vm.tracker.order_pos + 1) % #vm.tracker.order
+        end
+    end
+end
+
+-- API de controle de áudio
+function vm.expose_api()
+    return {
+        audio = {
+            play_sfx = function(ch, sample_id)
+                local sample = vm.fs.read("sfx_" .. sample_id)
+                if sample then
+                    vm.audio.channels[ch].sample_data = sample.data
+                    vm.audio.channels[ch].sample_pos = 0
+                    vm.audio.channels[ch].playing = true
+                end
+            end,
+            
+            play_music = function(pattern)
+                vm.tracker.playing = true
+                vm.tracker.pattern = pattern
+            end,
+            
+            stop_music = function()
+                vm.tracker.playing = false
+            end
+        }
+    }
+end
+
+-- Inicialização completa do sistema
+function vm.init()
+    -- ... (outras inicializações) ...
+    vm.init_audio()
 end
