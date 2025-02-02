@@ -1,190 +1,212 @@
-local bit32 = require("libs/bit32")
-
--- Configuração da memória
-vm.mem_size = 0x20000  -- 128KB total (64KB original + 64KB para arquivos)
-vm.CARTRIDGE_START = 0x0000    -- 64KB para cartuchos (0x0000-0xFFFF)
-vm.FS_START       = 0x10000    -- 64KB para arquivos (0x10000-0x1FFFF)
-vm.FS_HEADER_SIZE = 0x1000     -- 4KB para metadados
-
--- Tipos de arquivo atualizados
-vm.FILE_TYPES = {
-    TXT = 0x01,
-    LUA = 0x02,
-    PNG = 0x03,
-    WAV = 0x04,
-    F88 = 0x88  -- Tipo especial para cartuchos
-}
-
--- Inicialização da memória
-function vm.init()
-    vm.mem = {}
-    for i = 0, vm.mem_size - 1 do
-        vm.mem[i] = 0
-    end
-    
-    -- Inicializar sistema de arquivos
-    vm.fs_init()
-    
-    -- ... (resto da inicialização original)
-end
-
--- Sistema de arquivos na nova região de memória
-function vm.fs_init()
-    -- Cabeçalho estendido
-    vm:fs_write(vm.FS_START, "FSCPv2", 6)  -- Magic number
-    vm:fs_write(vm.FS_START + 6, 0x0000)   -- Número de arquivos
-    vm:fs_write(vm.FS_START + 8, 0x1000)   -- Endereço livre inicial
-    vm:fs_write(vm.FS_START + 10, 0x00)    -- Flags
-    
-    -- Tabela de arquivos
-    vm.fs_files = {}
-    vm.fs_free_space = vm.FS_START + vm.FS_HEADER_SIZE
-end
-
--- Funções de acesso à memória modificadas
-function vm.peek(addr)
-    if addr >= vm.CARTRIDGE_START and addr <= vm.CARTRIDGE_START + 0xFFFF then
-        return vm.mem[addr] or 0
-    end
-    -- Acesso normal para outras áreas
-    return vm.mem[addr] or 0
-end
-
-function vm.poke(addr, value)
-    value = bit32.band(value, 0xFF)
-    
-    -- Bloquear escrita na área do cartucho
-    if addr >= vm.CARTRIDGE_START and addr <= vm.CARTRIDGE_START + 0xFFFF then
-        return  -- Memória do cartucho é read-only
-    end
-    
-    -- Gerenciar escrita na área de arquivos
-    if addr >= vm.FS_START then
-        vm:fs_handle_write(addr, value)
-    else
-        vm.mem[addr] = value
-    end
-end
-
--- Sistema de arquivos aprimorado
-function vm:fs_handle_write(addr, value)
-    -- Implementação do sistema de arquivos com alocação FAT-like
-    local function get_fat_entry(entry)
-        local fat_start = vm.FS_START + 0x100
-        return vm:fs_read(fat_start + (entry * 4), 4)
-    end
-    
-    local function set_fat_entry(entry, value)
-        local fat_start = vm.FS_START + 0x100
-        vm:fs_write(fat_start + (entry * 4), value, 4)
-    end
-
-    -- ... (implementação completa do sistema de arquivos com FAT)
-end
-
--- Sistema de cartuchos atualizado
-function vm.load_cartridge(data)
-    -- Verificar assinatura
-    if data:sub(1,4) ~= "F88\x1A" then
-        error("Formato de cartucho inválido")
-    end
-    
-    -- Carregar para a área de cartuchos
-    for i = 1, math.min(#data, 0x10000) do
-        vm.mem[i-1] = data:byte(i)
-    end
-    
-    -- Mapear estrutura do cartucho
-    local header = {
-        version     = data:byte(5),
-        entry_point = vm:fs_read16(6),
-        crc         = vm:fs_read32(8),
-        flags       = vm:fs_read16(12),
-        name        = data:sub(14, 30),
-        author      = data:sub(31, 47)
-    }
-    
-    -- Executar ponto de entrada
-    local entry = vm.peek(header.entry_point)
-    if entry == 0xEA then  -- OPCODE NES (emulação básica)
-        vm:emulate_nes_cartridge(header)
-    else
-        local chunk = load(data:sub(65), "cartridge", "t", vm.expose_api())
-        if chunk then pcall(chunk) end
-    end
-end
-
--- Funções auxiliares para o sistema de arquivos
-function vm:fs_write(addr, data, size)
-    for i = 0, size - 1 do
-        vm.mem[addr + i] = bit32.band(data, 0xFF)
-        data = bit32.rshift(data, 8)
-    end
-end
-
-function vm:fs_read(addr, size)
-    local value = 0
-    for i = size - 1, 0, -1 do
-        value = bit32.lshift(value, 8) + vm.peek(addr + i)
-    end
-    return value
-end
-
--- API para desenvolvedores de cartuchos
-function vm.expose_cartridge_api()
-    local api = vm.expose_api()
-    
-    api.fs = {
-        open = function(filename, mode)
-            -- Implementação do sistema de arquivos do cartucho
-        end,
-        list = function()
-            -- Listar arquivos no cartucho
-        end,
-        load = function(filename)
-            -- Carregar recurso do cartucho
-        end
-    }
-    
-    api.mem = {
-        map = function(start, size)
-            -- Mapear região de memória
-            return {
-                read = function(offset)
-                    return vm.peek(start + offset)
-                end,
-                write = function(offset, value)
-                    vm.poke(start + offset, value)
-                end
-            }
-        end
-    }
-    
-    return api
-end
-
--- Controle de cartuchos
+-- main.lua
 local cartridges = {}
-local current_cart = 0
+local current_cart = nil
+local show_menu = false
+local menu_pos = {x=20, y=20}
+local menu_items = {}
+local selected_item = 1
+local font_texture = nil
+
+-- Sistema de Arquivos Avançado
+vm.FILE_TYPES.F99 = 0x99  -- Tipo para cartuchos Far-99
+vm.CARTRIDGE_HEADER_SIZE = 128  -- Bytes para metadados
+
+-- Estrutura do cabeçalho do cartucho (128 bytes)
+-- Offset  Tamanho  Descrição
+-- 0x00    4       Magic Number 'F99'
+-- 0x04    32      Título
+-- 0x24    32      Autor
+-- 0x44    16      Data (YYYYMMDDHHMMSS)
+-- 0x54    2       Versão (major/minor)
+-- 0x56    2       Tamanho do ícone (w/h)
+-- 0x58    64      Ícone (64 bytes para 16x16 4-color)
+-- 0x98    4       Tamanho do código
+-- 0x9C    4       Checksum
+
+function vm.load_cartridge(path)
+    local data = love.filesystem.read(path)
+    if not data:sub(1,3) == "F99" then
+        return nil, "Formato inválido"
+    end
+    
+    local cart = {
+        path = path,
+        header = {
+            title = data:sub(5,36):gsub("%z+$", ""),
+            author = data:sub(37,68):gsub("%z+$", ""),
+            date = data:sub(69,84),
+            version = {data:byte(85), data:byte(86)},
+            icon_size = {data:byte(87), data:byte(88)},
+            icon = data:sub(89,152),
+            code_size = string.unpack("<I4", data:sub(153,156)),
+            checksum = string.unpack("<I4", data:sub(157,160))
+        },
+        code = data:sub(161)
+    }
+    
+    -- Verificar checksum
+    local calc_crc = vm.crc32(data:sub(1,156))
+    if calc_crc ~= cart.header.checksum then
+        return nil, "Checksum inválido"
+    end
+    
+    return cart
+end
+
+function vm.init_cart_system()
+    -- Carregar cartuchos
+    local items = love.filesystem.getDirectoryItems("cartridges")
+    for _, file in ipairs(items) do
+        if file:match("%.F99$") then
+            local cart, err = vm.load_cartridge("cartridges/" .. file)
+            if cart then
+                table.insert(cartridges, cart)
+            end
+        end
+    end
+    
+    -- Carregar fonte para o menu
+    font_texture = love.graphics.newImage("font.png")
+end
+
+function love.load()
+    vm.init()
+    vm.init_cart_system()
+    
+    -- Carregar menu inicial
+    if #cartridges > 0 then
+        current_cart = 1
+        vm.load_cartridge_env(cartridges[current_cart])
+    end
+end
+
+function vm.load_cartridge_env(cart)
+    -- Criar ambiente sandbox
+    local env = {
+        print = function(...) end,  -- Bloquear acesso direto ao console
+        love = {
+            graphics = {
+                draw = function(...) end
+            }
+        }
+    }
+    
+    -- Carregar código do cartucho
+    local chunk = load(cart.code, "cartridge", "t", setmetatable(env, {__index = _G}))
+    pcall(chunk)
+    
+    -- Configurar callbacks
+    vm.cart_env = {
+        load = env.load,
+        update = env.update,
+        draw = env.draw
+    }
+end
+
+function love.update(dt)
+    -- Controle do menu
+    if love.keyboard.isDown("tab") then
+        show_menu = not show_menu
+    end
+    
+    if show_menu then
+        -- Navegação com mouse
+        local mx, my = love.mouse.getPosition()
+        mx = mx / 4  -- Ajustar para coordenadas do console
+        my = my / 4
+        
+        selected_item = 0
+        for i, item in ipairs(menu_items) do
+            if mx >= item.x and mx <= item.x + 120 and
+               my >= item.y and my <= item.y + 16 then
+                selected_item = i
+            end
+        end
+        
+        if love.mouse.isDown(1) and selected_item > 0 then
+            current_cart = selected_item
+            vm.load_cartridge_env(cartridges[current_cart])
+            show_menu = false
+        end
+    else
+        -- Executar cartucho atual
+        if vm.cart_env and vm.cart_env.update then
+            vm.cart_env.update(dt)
+        end
+    end
+end
+
+function love.draw()
+    -- Desenhar cartucho atual
+    if vm.cart_env and vm.cart_env.draw then
+        vm.cart_env.draw()
+    end
+    
+    -- Desenhar menu
+    if show_menu then
+        draw_menu()
+    end
+end
+
+function draw_menu()
+    -- Fundo do menu
+    color(1)
+    rect(menu_pos.x, menu_pos.y, 140, #cartridges * 18 + 8, true)
+    
+    -- Itens do menu
+    for i, cart in ipairs(cartridges) do
+        local y = menu_pos.y + 4 + (i-1)*18
+        local color_bg = i == selected_item and 15 or 3
+        local color_text = i == selected_item and 0 or 15
+        
+        -- Item de fundo
+        color(color_bg)
+        rect(menu_pos.x + 4, y, 132, 16, true)
+        
+        -- Ícone
+        draw_icon(cart.header.icon, menu_pos.x + 6, y + 2)
+        
+        -- Texto
+        color(color_text)
+        print_text(cart.header.title, menu_pos.x + 24, y + 4)
+        print_text(cart.header.author, menu_pos.x + 24, y + 12)
+    end
+end
+
+function draw_icon(icon_data, x, y)
+    for i = 1, 64 do
+        local byte = icon_data:byte(i)
+        for b=0, 3 do
+            local color = bit32.extract(byte, b*2, 2)
+            if color > 0 then
+                local px = x + ((i-1) % 8)*2 + math.floor(b/2)*1
+                local py = y + math.floor((i-1)/8)*2 + (b%2)*1
+                rect(px, py, 1, 1, true)
+            end
+        end
+    end
+end
+
+function print_text(text, x, y)
+    for i=1, #text do
+        local c = text:sub(i,i):byte()
+        local tx = (c % 16) * 8
+        local ty = math.floor(c / 16) * 8
+        love.graphics.draw(font_texture, love.graphics.newQuad(tx, ty, 8, 8, 128, 128), x + (i-1)*8, y)
+    end
+end
 
 function love.keypressed(key)
-    if key == "tab" then
-        current_cart = (current_cart + 1) % #cartridges
-        vm.load_cartridge(cartridges[current_cart + 1])
-    end
-end
-
--- Função para carregar cartuchos da pasta /cartridges
-function love.load()
-    local files = love.filesystem.getDirectoryItems("cartridges")
-    for _, file in ipairs(files) do
-        if file:match("%.F88$") then
-            local data = love.filesystem.read("cartridges/" .. file)
-            table.insert(cartridges, data)
+    if show_menu then
+        -- Navegação pelo teclado
+        if key == "up" then
+            selected_item = math.max(1, selected_item - 1)
+        elseif key == "down" then
+            selected_item = math.min(#cartridges, selected_item + 1)
+        elseif key == "return" then
+            current_cart = selected_item
+            vm.load_cartridge_env(cartridges[current_cart])
+            show_menu = false
         end
-    end
-    
-    if #cartridges > 0 then
-        vm.load_cartridge(cartridges[1])
     end
 end
