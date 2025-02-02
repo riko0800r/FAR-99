@@ -1,119 +1,258 @@
--- Adicionar/modificar estas funções no main.lua
+-- main.lua
+local bit32 = require("libs/bit32")
 
--- Função para escrever dados na memória
-function vm.fs_write(addr, data)
-    for i = 1, #data do
-        vm.mem[addr + i - 1] = data:byte(i)
+-- Ampliar memória para 128KB total (96KB originais + 32KB extra)
+vm.mem_size = 0x20000
+vm.FS_START = 0x10000  -- 64KB para sistema de arquivos
+vm.CHUNK_SIZE = 512    -- Tamanho de alocação básico
+
+-- Tipos de arquivo estendidos (0x00-0x7F reservados)
+vm.FILE_TYPES = {
+    SPRITE = 0x10,     -- Sprite 16x16 + metadados
+    TRACKER = 0x11,    -- Música tipo tracker
+    BITFONT = 0x12,    -- Fonte bitmap
+    VECTORFONT = 0x13, -- Fonte vetorial simplificada
+    MAP = 0x14,        -- Mapa de tiles
+    CONFIG = 0x15,     -- Arquivo de configuração
+    SCRIPT = 0x16      -- Código executável
+}
+
+-- Sistema de arquivos melhorado
+vm.filesystem = {
+    fat = {},           -- File Allocation Table
+    entries = {},       -- Metadados
+    chunk_map = {},
+    next_chunk = 1
+}
+
+function vm.fs_init()
+    -- Inicializar FAT
+    local total_chunks = (vm.mem_size - vm.FS_START) / vm.CHUNK_SIZE
+    for i = 1, total_chunks do
+        vm.filesystem.chunk_map[i] = false
     end
+    
+    -- Escrever assinatura do sistema
+    vm:fs_write(vm.FS_START, string.char(0x46, 0x53, 0x32, 0x30)) -- 'FS20'
 end
 
--- Função para atualizar a FAT
-function vm.fs_update_fat()
-    -- Construir a tabela FAT
-    local fat_data = ""
+-- Sistema baseado em chunks
+function vm.fs_allocate(chunks)
+    local allocated = {}
     for i = 1, #vm.filesystem.chunk_map do
-        fat_data = fat_data .. (vm.filesystem.chunk_map[i] and "\x01" or "\x00")
+        if not vm.filesystem.chunk_map[i] then
+            table.insert(allocated, i)
+            if #allocated == chunks then
+                for _, c in ipairs(allocated) do
+                    vm.filesystem.chunk_map[c] = true
+                end
+                return allocated
+            end
+        end
     end
-    
-    -- Escrever FAT no início do sistema de arquivos
-    local fat_start = vm.FS_START + 4  -- Após a assinatura 'FS20'
-    vm.fs_write(fat_start, fat_data)
-    
-    -- Escrever número total de chunks
-    local total_chunks = #vm.filesystem.chunk_map
-    vm.mem[fat_start + #fat_data] = bit32.band(total_chunks, 0xFF)
-    vm.mem[fat_start + #fat_data + 1] = bit32.rshift(total_chunks, 8)
+    return nil
 end
 
--- Função auxiliar para escrever entradas de diretório
-function vm.fs_update_dir_entries()
-    local dir_start = vm.FS_START + 4 + math.ceil(#vm.filesystem.chunk_map / 8) + 2
-    local entries = ""
-    
-    for name, entry in pairs(vm.filesystem.entries) do
-        local entry_data = string.pack("<Bc12I3I2",
-            entry.type,
-            name:sub(1,12),
-            entry.size,
-            entry.chunks[1]
+-- Formatos Especiais ---------------------------------------------------------
+
+-- Sprite 16x16 (68 bytes)
+function vm.fs_create_sprite(name, pixels, paleta, anim)
+    local data = ""
+    -- Pixel data (256 nibbles compactados)
+    for i = 0, 255, 2 do
+        data = data .. string.char(
+            (pixels[i+1] << 4) | pixels[i+2]
         )
-        entries = entries .. entry_data
     end
+    -- Paleta (16 cores RGB332)
+    for _, c in ipairs(paleta) do
+        data = data .. string.char(
+            (c.r << 5) | (c.g << 2) | (c.b >> 1)
+        )
+    end
+    -- Animação (frames e velocidade)
+    data = data .. string.char(anim.frames)
+    data = data .. string.char(anim.speed)
     
-    vm.fs_write(dir_start, entries)
+    return vm.fs_create(name, vm.FILE_TYPES.SPRITE, data)
 end
 
--- Função completa de criação de arquivos revisada
-function vm.fs_create(name, ftype, data)
-    -- Verificar nome único
-    if vm.filesystem.entries[name] then
-        return false, "file_exists"
+-- Música Tracker (formato simplificado)
+function vm.fs_create_song(name, bpm, patterns, instruments)
+    local header = string.pack("<I2I1I1", bpm, #patterns, #instruments)
+    local data = header
+    
+    -- Instrumentos (formato OPL2 simplificado)
+    for _, inst in ipairs(instruments) do
+        data = data .. string.pack("<I1I1I1I1I1",
+            inst.multiplier,
+            inst.attack,
+            inst.decay,
+            inst.sustain,
+            inst.release
+        )
     end
     
-    -- Calcular chunks necessários
+    -- Padrões musicais
+    for _, pattern in ipairs(patterns) do
+        data = data .. string.pack("B", pattern.length)
+        for _, note in ipairs(pattern.notes) do
+            data = data .. string.pack("<I2I1I1",
+                note.frequency,
+                note.instrument,
+                note.effect
+            )
+        end
+    end
+    
+    return vm.fs_create(name, vm.FILE_TYPES.TRACKER, data)
+end
+
+-- Fonte Bitmap (8x8 pixels)
+function vm.fs_create_font(name, glyphs)
+    local data = ""
+    for i = 32, 127 do  -- ASCII básico
+        local g = glyphs[i] or glyphs[32]
+        for y = 1, 8 do
+            local byte = 0
+            for x = 1, 8 do
+                byte = byte | ((g[y][x] and 1 or 0) << (8 - x))
+            end
+            data = data .. string.char(byte)
+        end
+    end
+    return vm.fs_create(name, vm.FILE_TYPES.BITFONT, data)
+end
+
+-- Sistema de Arquivos Genérico -------------------------------------------------
+function vm.fs_create(name, ftype, data)
     local chunks_needed = math.ceil(#data / vm.CHUNK_SIZE)
     local chunks = vm.fs_allocate(chunks_needed)
     if not chunks then return false, "out_of_space" end
     
-    -- Criar entrada
     local entry = {
         name = name,
         type = ftype,
         chunks = chunks,
         size = #data,
-        timestamp = os.time()
+        timestamp = os.time(),
+        address = vm.FS_START + (chunks[1]-1)*vm.CHUNK_SIZE
     }
     
     -- Escrever dados
-    local write_ptr = vm.FS_START + (chunks[1] - 1) * vm.CHUNK_SIZE
-    vm.fs_write(write_ptr, data)
+    for i = 1, #data do
+        local addr = entry.address + i - 1
+        vm.mem[addr] = data:byte(i)
+    end
     
-    -- Atualizar estruturas
+    -- Atualizar FAT
     vm.filesystem.entries[name] = entry
-    vm.fs_update_fat()
-    vm.fs_update_dir_entries()
-    
+    vm:fs_update_fat()
     return true
 end
 
--- Função de leitura revisada
 function vm.fs_read(name)
     local entry = vm.filesystem.entries[name]
     if not entry then return nil end
     
     local data = ""
-    for _, chunk in ipairs(entry.chunks) do
-        local chunk_start = vm.FS_START + (chunk - 1) * vm.CHUNK_SIZE
-        local chunk_end = chunk_start + vm.CHUNK_SIZE - 1
-        for addr = chunk_start, math.min(chunk_end, chunk_start + entry.size - 1) do
-            data = data .. string.char(vm.mem[addr])
-        end
+    for addr = entry.address, entry.address + entry.size - 1 do
+        data = data .. string.char(vm.mem[addr])
     end
     
     return {
         type = entry.type,
-        data = data:sub(1, entry.size),
+        data = data,
         size = entry.size,
         created = entry.timestamp
     }
 end
 
--- Função de deleção
-function vm.fs_delete(name)
-    local entry = vm.filesystem.entries[name]
-    if not entry then return false end
-    
-    -- Liberar chunks
-    for _, chunk in ipairs(entry.chunks) do
-        vm.filesystem.chunk_map[chunk] = false
-    end
-    
-    -- Remover entrada
-    vm.filesystem.entries[name] = nil
-    
-    -- Atualizar estruturas
-    vm.fs_update_fat()
-    vm.fs_update_dir_entries()
-    
-    return true
+-- API de Alto Nível -----------------------------------------------------------
+function vm.expose_api()
+    return {
+        -- Sistema de Arquivos
+        fs = {
+            create = vm.fs_create,
+            read = vm.fs_read,
+            delete = function(name)
+                -- Implementação similar à anterior
+            end,
+            list = function() return vm.filesystem.entries end,
+            
+            -- Formatos Especiais
+            create_sprite = vm.fs_create_sprite,
+            create_song = vm.fs_create_song,
+            create_font = vm.fs_create_font,
+            
+            -- Conversores
+            import_ttf = function(name, ttf_data, size)
+                -- Converte TTF para bitmap font
+                local img = love.image.newImageData(128, 128)
+                -- [...] Processamento complexo
+                return vm.fs_create_font(name, processed_glyphs)
+            end,
+            
+            import_audio = function(name, wav_data)
+                -- Converte para formato tracker
+                -- [...] Análise do áudio
+                return vm.fs_create_song(name, converted_data)
+            end
+        },
+        
+        -- Player de Música
+        music = {
+            play = function(name)
+                local song = vm.fs_read(name)
+                if song.type == vm.FILE_TYPES.TRACKER then
+                    -- Interpretar formato tracker
+                end
+            end
+        },
+        
+        -- Sistema de Fontes
+        font = {
+            load = function(name)
+                local f = vm.fs_read(name)
+                if f.type == vm.FILE_TYPES.BITFONT then
+                    return vm.font_create(f.data)
+                end
+            end
+        }
+    }
 end
+
+-- Exemplos de Uso -------------------------------------------------------------
+--[[
+-- Criar sprite
+local pal = {
+    {r=0, g=0, b=0},    -- Preto
+    {r=7, g=7, b=7},    -- Branco
+    -- ... 14 cores ...
+}
+local pixels = {0,1,1,0,...} -- 256 valores (0-15)
+fs.create_sprite("hero", pixels, pal, {frames=4, speed=10})
+
+-- Criar música
+local instruments = {
+    { multiplier=1, attack=5, decay=3, sustain=15, release=5 }
+}
+local patterns = {
+    {
+        length = 16,
+        notes = {
+            {frequency=440, instrument=1, effect=0},
+            -- ... 15 notas ...
+        }
+    }
+}
+fs.create_song("theme", 120, patterns, instruments)
+
+-- Criar fonte
+local glyphs = {
+    [32] = {{0,0,0,0,0,0,0,0}, ...}, -- Espaço
+    [65] = {{0,1,1,0,1,1,1,0}, ...}, -- A
+    -- ... outros glifos ...
+}
+fs.create_font("pixel_font", glyphs)
+]]
