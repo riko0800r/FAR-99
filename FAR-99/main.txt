@@ -1,267 +1,190 @@
--- Adições ao main.lua
 local bit32 = require("libs/bit32")
 
--- Configurações do sistema de cartuchos
-vm.CARTRIDGE_EXT = ".F88"
-vm.CARTRIDGE_MAGIC = "FANTASY88"
-vm.ROOT_DIR = "/"
-vm.current_cartridge = nil
-vm.cartridge_slot = 0xE000  -- Endereço para carregar cartuchos
+-- Configuração da memória
+vm.mem_size = 0x20000  -- 128KB total (64KB original + 64KB para arquivos)
+vm.CARTRIDGE_START = 0x0000    -- 64KB para cartuchos (0x0000-0xFFFF)
+vm.FS_START       = 0x10000    -- 64KB para arquivos (0x10000-0x1FFFF)
+vm.FS_HEADER_SIZE = 0x1000     -- 4KB para metadados
 
--- Estrutura do sistema de arquivos estendido
-vm.filesystem = {
-    root = {
-        name = "",
-        type = "dir",
-        children = {},
-        parent = nil
-    },
-    current_dir = nil,
-    inode_counter = 1
+-- Tipos de arquivo atualizados
+vm.FILE_TYPES = {
+    TXT = 0x01,
+    LUA = 0x02,
+    PNG = 0x03,
+    WAV = 0x04,
+    F88 = 0x88  -- Tipo especial para cartuchos
 }
 
--- Metamodelo para nós do sistema de arquivos
-local fs_node_mt = {
-    __index = {
-        get_path = function(self)
-            local path = {}
-            local node = self
-            while node.parent do
-                table.insert(path, 1, node.name)
-                node = node.parent
-            end
-            return "/" .. table.concat(path, "/")
-        end,
-        
-        find = function(self, name)
-            for _, child in ipairs(self.children) do
-                if child.name == name then
-                    return child
-                end
-            end
-        end,
-        
-        add = function(self, node)
-            node.parent = self
-            node.inode = vm.filesystem.inode_counter
-            vm.filesystem.inode_counter = vm.filesystem.inode_counter + 1
-            table.insert(self.children, node)
-        end,
-        
-        remove = function(self, name)
-            for i, child in ipairs(self.children) do
-                if child.name == name then
-                    table.remove(self.children, i)
-                    return true
-                end
-            end
-            return false
-        end
-    }
-}
+-- Inicialização da memória
+function vm.init()
+    vm.mem = {}
+    for i = 0, vm.mem_size - 1 do
+        vm.mem[i] = 0
+    end
+    
+    -- Inicializar sistema de arquivos
+    vm.fs_init()
+    
+    -- ... (resto da inicialização original)
+end
 
--- Funções do sistema de arquivos
+-- Sistema de arquivos na nova região de memória
 function vm.fs_init()
-    vm.filesystem.current_dir = vm.filesystem.root
-    vm.filesystem.root.children = {}
+    -- Cabeçalho estendido
+    vm:fs_write(vm.FS_START, "FSCPv2", 6)  -- Magic number
+    vm:fs_write(vm.FS_START + 6, 0x0000)   -- Número de arquivos
+    vm:fs_write(vm.FS_START + 8, 0x1000)   -- Endereço livre inicial
+    vm:fs_write(vm.FS_START + 10, 0x00)    -- Flags
     
-    -- Montar sistema de arquivos básico
-    local sys = {
-        name = "sys",
-        type = "dir",
-        children = {
-            {name = "bin", type = "dir"},
-            {name = "lib", type = "dir"},
-            {name = "dev", type = "dir"}
-        }
-    }
-    vm.filesystem.root:add(sys)
+    -- Tabela de arquivos
+    vm.fs_files = {}
+    vm.fs_free_space = vm.FS_START + vm.FS_HEADER_SIZE
 end
 
-function vm.fs_mkdir(path)
-    local parts = vm.fs_split_path(path)
-    local current = vm.filesystem.current_dir
-    
-    for i, part in ipairs(parts) do
-        local node = current:find(part)
-        if not node then
-            node = {name = part, type = "dir", children = {}}
-            current:add(node)
-        end
-        current = node
+-- Funções de acesso à memória modificadas
+function vm.peek(addr)
+    if addr >= vm.CARTRIDGE_START and addr <= vm.CARTRIDGE_START + 0xFFFF then
+        return vm.mem[addr] or 0
     end
+    -- Acesso normal para outras áreas
+    return vm.mem[addr] or 0
 end
 
-function vm.fs_touch(path, data, filetype)
-    local parts = vm.fs_split_path(path)
-    local filename = table.remove(parts)
-    local dir = vm.fs_resolve_path(parts)
-    
-    if dir then
-        local node = {
-            name = filename,
-            type = "file",
-            data = data,
-            filetype = filetype,
-            created = os.time(),
-            modified = os.time()
-        }
-        dir:add(node)
-        return true
-    end
-    return false
-end
-
-function vm.fs_resolve_path(parts)
-    local current = vm.filesystem.current_dir
-    for _, part in ipairs(parts) do
-        if part == ".." then
-            current = current.parent or current
-        elseif part ~= "." then
-            current = current:find(part)
-            if not current then return nil end
-        end
-    end
-    return current
-end
-
-function vm.fs_split_path(path)
-    local parts = {}
-    for part in path:gmatch("[^/]+") do
-        table.insert(parts, part)
-    end
-    return parts
-end
-
--- Sistema de cartuchos
-function vm.load_cartridge(path)
-    local node = vm.fs_resolve_path(vm.fs_split_path(path))
-    if node and node.filetype == "cartridge" then
-        vm.current_cartridge = node
-        vm.mem[vm.cartridge_slot] = 1  -- Sinaliza cartucho carregado
-        
-        -- Mapear memória do cartucho
-        for i = 1, #node.data do
-            vm.mem[vm.cartridge_slot + i] = node.data:byte(i)
-        end
-        
-        -- Executar código do cartucho
-        local chunk, err = load(node.data:sub(17))  -- Pular header
-        if chunk then
-            setfenv(chunk, vm.expose_api())
-            pcall(chunk)
-        else
-            print("Erro no cartucho:", err)
-        end
-        return true
-    end
-    return false
-end
-
-function vm.unload_cartridge()
-    if vm.current_cartridge then
-        -- Limpar memória do cartucho
-        for i = vm.cartridge_slot, vm.mem_size - 1 do
-            vm.mem[i] = 0
-        end
-        vm.current_cartridge = nil
-    end
-end
-
--- Atualizar a função poke para lidar com cartuchos
 function vm.poke(addr, value)
-    if addr >= vm.cartridge_slot then
-        -- Memória do cartucho é read-only
-        return
+    value = bit32.band(value, 0xFF)
+    
+    -- Bloquear escrita na área do cartucho
+    if addr >= vm.CARTRIDGE_START and addr <= vm.CARTRIDGE_START + 0xFFFF then
+        return  -- Memória do cartucho é read-only
     end
-    -- ... (restante da função original)
+    
+    -- Gerenciar escrita na área de arquivos
+    if addr >= vm.FS_START then
+        vm:fs_handle_write(addr, value)
+    else
+        vm.mem[addr] = value
+    end
 end
 
--- Adicionar à API exposta
-function vm.expose_api()
-    return {
-        -- ... outras funções anteriores ...
-        fs = {
-            mkdir = vm.fs_mkdir,
-            touch = vm.fs_touch,
-            ls = function(path)
-                local dir = vm.fs_resolve_path(vm.fs_split_path(path)) or
-                            vm.filesystem.current_dir
-                return dir.children
-            end,
-            cd = function(path)
-                local dir = vm.fs_resolve_path(vm.fs_split_path(path))
-                if dir and dir.type == "dir" then
-                    vm.filesystem.current_dir = dir
-                    return true
-                end
-                return false
-            end,
-            pwd = function()
-                return vm.filesystem.current_dir:get_path()
-            end
-        },
-        
-        cartridge = {
-            load = vm.load_cartridge,
-            unload = vm.unload_cartridge,
-            list = function()
-                local cartridges = {}
-                local function search(node)
-                    if node.type == "file" and node.filetype == "cartridge" then
-                        table.insert(cartridges, node:get_path())
-                    elseif node.type == "dir" then
-                        for _, child in ipairs(node.children) do
-                            search(child)
-                        end
-                    end
-                end
-                search(vm.filesystem.root)
-                return cartridges
-            end
-        }
+-- Sistema de arquivos aprimorado
+function vm:fs_handle_write(addr, value)
+    -- Implementação do sistema de arquivos com alocação FAT-like
+    local function get_fat_entry(entry)
+        local fat_start = vm.FS_START + 0x100
+        return vm:fs_read(fat_start + (entry * 4), 4)
+    end
+    
+    local function set_fat_entry(entry, value)
+        local fat_start = vm.FS_START + 0x100
+        vm:fs_write(fat_start + (entry * 4), value, 4)
+    end
+
+    -- ... (implementação completa do sistema de arquivos com FAT)
+end
+
+-- Sistema de cartuchos atualizado
+function vm.load_cartridge(data)
+    -- Verificar assinatura
+    if data:sub(1,4) ~= "F88\x1A" then
+        error("Formato de cartucho inválido")
+    end
+    
+    -- Carregar para a área de cartuchos
+    for i = 1, math.min(#data, 0x10000) do
+        vm.mem[i-1] = data:byte(i)
+    end
+    
+    -- Mapear estrutura do cartucho
+    local header = {
+        version     = data:byte(5),
+        entry_point = vm:fs_read16(6),
+        crc         = vm:fs_read32(8),
+        flags       = vm:fs_read16(12),
+        name        = data:sub(14, 30),
+        author      = data:sub(31, 47)
     }
+    
+    -- Executar ponto de entrada
+    local entry = vm.peek(header.entry_point)
+    if entry == 0xEA then  -- OPCODE NES (emulação básica)
+        vm:emulate_nes_cartridge(header)
+    else
+        local chunk = load(data:sub(65), "cartridge", "t", vm.expose_api())
+        if chunk then pcall(chunk) end
+    end
 end
 
--- Sistema de input para troca de cartuchos
-local cartridge_index = 1
+-- Funções auxiliares para o sistema de arquivos
+function vm:fs_write(addr, data, size)
+    for i = 0, size - 1 do
+        vm.mem[addr + i] = bit32.band(data, 0xFF)
+        data = bit32.rshift(data, 8)
+    end
+end
+
+function vm:fs_read(addr, size)
+    local value = 0
+    for i = size - 1, 0, -1 do
+        value = bit32.lshift(value, 8) + vm.peek(addr + i)
+    end
+    return value
+end
+
+-- API para desenvolvedores de cartuchos
+function vm.expose_cartridge_api()
+    local api = vm.expose_api()
+    
+    api.fs = {
+        open = function(filename, mode)
+            -- Implementação do sistema de arquivos do cartucho
+        end,
+        list = function()
+            -- Listar arquivos no cartucho
+        end,
+        load = function(filename)
+            -- Carregar recurso do cartucho
+        end
+    }
+    
+    api.mem = {
+        map = function(start, size)
+            -- Mapear região de memória
+            return {
+                read = function(offset)
+                    return vm.peek(start + offset)
+                end,
+                write = function(offset, value)
+                    vm.poke(start + offset, value)
+                end
+            }
+        end
+    }
+    
+    return api
+end
+
+-- Controle de cartuchos
 local cartridges = {}
+local current_cart = 0
 
 function love.keypressed(key)
     if key == "tab" then
-        cartridges = vm.expose_api().cartridge.list()
-        if #cartridges > 0 then
-            cartridge_index = (cartridge_index % #cartridges) + 1
-            vm.unload_cartridge()
-            vm.load_cartridge(cartridges[cartridge_index])
-        end
+        current_cart = (current_cart + 1) % #cartridges
+        vm.load_cartridge(cartridges[current_cart + 1])
     end
-    -- ... (restante do código original)
 end
 
--- Função para criar cartuchos .F88
-function vm.create_cartridge(files, metadata)
-    local header = vm.CARTRIDGE_MAGIC ..
-                  string.pack("<I2", metadata.version or 1) ..
-                  string.pack("<I4", os.time()) ..
-                  string.char(#metadata.title) ..
-                  metadata.title ..
-                  string.rep("\0", 16 - #metadata.title)
-    
-    local body = ""
-    local function pack_file(node)
-        body = body .. string.pack("<I2", node.type == "dir" and 1 or 0) ..
-                      string.pack("<I2", #node.name) ..
-                      node.name ..
-                      string.pack("<I4", #node.data) ..
-                      node.data
-        if node.type == "dir" then
-            for _, child in ipairs(node.children) do
-                pack_file(child)
-            end
+-- Função para carregar cartuchos da pasta /cartridges
+function love.load()
+    local files = love.filesystem.getDirectoryItems("cartridges")
+    for _, file in ipairs(files) do
+        if file:match("%.F88$") then
+            local data = love.filesystem.read("cartridges/" .. file)
+            table.insert(cartridges, data)
         end
     end
     
-    pack_file(files)
-    return header .. body
+    if #cartridges > 0 then
+        vm.load_cartridge(cartridges[1])
+    end
 end
