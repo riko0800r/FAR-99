@@ -1,267 +1,119 @@
--- Adições ao main.lua
-local bit32 = require("libs/bit32")
+-- Adicionar/modificar estas funções no main.lua
 
--- Configurações do sistema de cartuchos
-vm.CARTRIDGE_EXT = ".F88"
-vm.CARTRIDGE_MAGIC = "FANTASY88"
-vm.ROOT_DIR = "/"
-vm.current_cartridge = nil
-vm.cartridge_slot = 0xE000  -- Endereço para carregar cartuchos
+-- Função para escrever dados na memória
+function vm.fs_write(addr, data)
+    for i = 1, #data do
+        vm.mem[addr + i - 1] = data:byte(i)
+    end
+end
 
--- Estrutura do sistema de arquivos estendido
-vm.filesystem = {
-    root = {
-        name = "",
-        type = "dir",
-        children = {},
-        parent = nil
-    },
-    current_dir = nil,
-    inode_counter = 1
-}
+-- Função para atualizar a FAT
+function vm.fs_update_fat()
+    -- Construir a tabela FAT
+    local fat_data = ""
+    for i = 1, #vm.filesystem.chunk_map do
+        fat_data = fat_data .. (vm.filesystem.chunk_map[i] and "\x01" or "\x00")
+    end
+    
+    -- Escrever FAT no início do sistema de arquivos
+    local fat_start = vm.FS_START + 4  -- Após a assinatura 'FS20'
+    vm.fs_write(fat_start, fat_data)
+    
+    -- Escrever número total de chunks
+    local total_chunks = #vm.filesystem.chunk_map
+    vm.mem[fat_start + #fat_data] = bit32.band(total_chunks, 0xFF)
+    vm.mem[fat_start + #fat_data + 1] = bit32.rshift(total_chunks, 8)
+end
 
--- Metamodelo para nós do sistema de arquivos
-local fs_node_mt = {
-    __index = {
-        get_path = function(self)
-            local path = {}
-            local node = self
-            while node.parent do
-                table.insert(path, 1, node.name)
-                node = node.parent
-            end
-            return "/" .. table.concat(path, "/")
-        end,
-        
-        find = function(self, name)
-            for _, child in ipairs(self.children) do
-                if child.name == name then
-                    return child
-                end
-            end
-        end,
-        
-        add = function(self, node)
-            node.parent = self
-            node.inode = vm.filesystem.inode_counter
-            vm.filesystem.inode_counter = vm.filesystem.inode_counter + 1
-            table.insert(self.children, node)
-        end,
-        
-        remove = function(self, name)
-            for i, child in ipairs(self.children) do
-                if child.name == name then
-                    table.remove(self.children, i)
-                    return true
-                end
-            end
-            return false
-        end
+-- Função auxiliar para escrever entradas de diretório
+function vm.fs_update_dir_entries()
+    local dir_start = vm.FS_START + 4 + math.ceil(#vm.filesystem.chunk_map / 8) + 2
+    local entries = ""
+    
+    for name, entry in pairs(vm.filesystem.entries) do
+        local entry_data = string.pack("<Bc12I3I2",
+            entry.type,
+            name:sub(1,12),
+            entry.size,
+            entry.chunks[1]
+        )
+        entries = entries .. entry_data
+    end
+    
+    vm.fs_write(dir_start, entries)
+end
+
+-- Função completa de criação de arquivos revisada
+function vm.fs_create(name, ftype, data)
+    -- Verificar nome único
+    if vm.filesystem.entries[name] then
+        return false, "file_exists"
+    end
+    
+    -- Calcular chunks necessários
+    local chunks_needed = math.ceil(#data / vm.CHUNK_SIZE)
+    local chunks = vm.fs_allocate(chunks_needed)
+    if not chunks then return false, "out_of_space" end
+    
+    -- Criar entrada
+    local entry = {
+        name = name,
+        type = ftype,
+        chunks = chunks,
+        size = #data,
+        timestamp = os.time()
     }
-}
-
--- Funções do sistema de arquivos
-function vm.fs_init()
-    vm.filesystem.current_dir = vm.filesystem.root
-    vm.filesystem.root.children = {}
     
-    -- Montar sistema de arquivos básico
-    local sys = {
-        name = "sys",
-        type = "dir",
-        children = {
-            {name = "bin", type = "dir"},
-            {name = "lib", type = "dir"},
-            {name = "dev", type = "dir"}
-        }
-    }
-    vm.filesystem.root:add(sys)
-end
-
-function vm.fs_mkdir(path)
-    local parts = vm.fs_split_path(path)
-    local current = vm.filesystem.current_dir
+    -- Escrever dados
+    local write_ptr = vm.FS_START + (chunks[1] - 1) * vm.CHUNK_SIZE
+    vm.fs_write(write_ptr, data)
     
-    for i, part in ipairs(parts) do
-        local node = current:find(part)
-        if not node then
-            node = {name = part, type = "dir", children = {}}
-            current:add(node)
-        end
-        current = node
-    end
-end
-
-function vm.fs_touch(path, data, filetype)
-    local parts = vm.fs_split_path(path)
-    local filename = table.remove(parts)
-    local dir = vm.fs_resolve_path(parts)
+    -- Atualizar estruturas
+    vm.filesystem.entries[name] = entry
+    vm.fs_update_fat()
+    vm.fs_update_dir_entries()
     
-    if dir then
-        local node = {
-            name = filename,
-            type = "file",
-            data = data,
-            filetype = filetype,
-            created = os.time(),
-            modified = os.time()
-        }
-        dir:add(node)
-        return true
-    end
-    return false
+    return true
 end
 
-function vm.fs_resolve_path(parts)
-    local current = vm.filesystem.current_dir
-    for _, part in ipairs(parts) do
-        if part == ".." then
-            current = current.parent or current
-        elseif part ~= "." then
-            current = current:find(part)
-            if not current then return nil end
+-- Função de leitura revisada
+function vm.fs_read(name)
+    local entry = vm.filesystem.entries[name]
+    if not entry then return nil end
+    
+    local data = ""
+    for _, chunk in ipairs(entry.chunks) do
+        local chunk_start = vm.FS_START + (chunk - 1) * vm.CHUNK_SIZE
+        local chunk_end = chunk_start + vm.CHUNK_SIZE - 1
+        for addr = chunk_start, math.min(chunk_end, chunk_start + entry.size - 1) do
+            data = data .. string.char(vm.mem[addr])
         end
     end
-    return current
-end
-
-function vm.fs_split_path(path)
-    local parts = {}
-    for part in path:gmatch("[^/]+") do
-        table.insert(parts, part)
-    end
-    return parts
-end
-
--- Sistema de cartuchos
-function vm.load_cartridge(path)
-    local node = vm.fs_resolve_path(vm.fs_split_path(path))
-    if node and node.filetype == "cartridge" then
-        vm.current_cartridge = node
-        vm.mem[vm.cartridge_slot] = 1  -- Sinaliza cartucho carregado
-        
-        -- Mapear memória do cartucho
-        for i = 1, #node.data do
-            vm.mem[vm.cartridge_slot + i] = node.data:byte(i)
-        end
-        
-        -- Executar código do cartucho
-        local chunk, err = load(node.data:sub(17))  -- Pular header
-        if chunk then
-            setfenv(chunk, vm.expose_api())
-            pcall(chunk)
-        else
-            print("Erro no cartucho:", err)
-        end
-        return true
-    end
-    return false
-end
-
-function vm.unload_cartridge()
-    if vm.current_cartridge then
-        -- Limpar memória do cartucho
-        for i = vm.cartridge_slot, vm.mem_size - 1 do
-            vm.mem[i] = 0
-        end
-        vm.current_cartridge = nil
-    end
-end
-
--- Atualizar a função poke para lidar com cartuchos
-function vm.poke(addr, value)
-    if addr >= vm.cartridge_slot then
-        -- Memória do cartucho é read-only
-        return
-    end
-    -- ... (restante da função original)
-end
-
--- Adicionar à API exposta
-function vm.expose_api()
+    
     return {
-        -- ... outras funções anteriores ...
-        fs = {
-            mkdir = vm.fs_mkdir,
-            touch = vm.fs_touch,
-            ls = function(path)
-                local dir = vm.fs_resolve_path(vm.fs_split_path(path)) or
-                            vm.filesystem.current_dir
-                return dir.children
-            end,
-            cd = function(path)
-                local dir = vm.fs_resolve_path(vm.fs_split_path(path))
-                if dir and dir.type == "dir" then
-                    vm.filesystem.current_dir = dir
-                    return true
-                end
-                return false
-            end,
-            pwd = function()
-                return vm.filesystem.current_dir:get_path()
-            end
-        },
-        
-        cartridge = {
-            load = vm.load_cartridge,
-            unload = vm.unload_cartridge,
-            list = function()
-                local cartridges = {}
-                local function search(node)
-                    if node.type == "file" and node.filetype == "cartridge" then
-                        table.insert(cartridges, node:get_path())
-                    elseif node.type == "dir" then
-                        for _, child in ipairs(node.children) do
-                            search(child)
-                        end
-                    end
-                end
-                search(vm.filesystem.root)
-                return cartridges
-            end
-        }
+        type = entry.type,
+        data = data:sub(1, entry.size),
+        size = entry.size,
+        created = entry.timestamp
     }
 end
 
--- Sistema de input para troca de cartuchos
-local cartridge_index = 1
-local cartridges = {}
-
-function love.keypressed(key)
-    if key == "tab" then
-        cartridges = vm.expose_api().cartridge.list()
-        if #cartridges > 0 then
-            cartridge_index = (cartridge_index % #cartridges) + 1
-            vm.unload_cartridge()
-            vm.load_cartridge(cartridges[cartridge_index])
-        end
-    end
-    -- ... (restante do código original)
-end
-
--- Função para criar cartuchos .F88
-function vm.create_cartridge(files, metadata)
-    local header = vm.CARTRIDGE_MAGIC ..
-                  string.pack("<I2", metadata.version or 1) ..
-                  string.pack("<I4", os.time()) ..
-                  string.char(#metadata.title) ..
-                  metadata.title ..
-                  string.rep("\0", 16 - #metadata.title)
+-- Função de deleção
+function vm.fs_delete(name)
+    local entry = vm.filesystem.entries[name]
+    if not entry then return false end
     
-    local body = ""
-    local function pack_file(node)
-        body = body .. string.pack("<I2", node.type == "dir" and 1 or 0) ..
-                      string.pack("<I2", #node.name) ..
-                      node.name ..
-                      string.pack("<I4", #node.data) ..
-                      node.data
-        if node.type == "dir" then
-            for _, child in ipairs(node.children) do
-                pack_file(child)
-            end
-        end
+    -- Liberar chunks
+    for _, chunk in ipairs(entry.chunks) do
+        vm.filesystem.chunk_map[chunk] = false
     end
     
-    pack_file(files)
-    return header .. body
+    -- Remover entrada
+    vm.filesystem.entries[name] = nil
+    
+    -- Atualizar estruturas
+    vm.fs_update_fat()
+    vm.fs_update_dir_entries()
+    
+    return true
 end
