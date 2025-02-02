@@ -17,15 +17,16 @@ vm = {
     ADDR_SOUND_BANK = 0xC000,
     ADDR_SOUND_CTRL = 0xFFF0,
     
-    -- filesystem
+    -- filesystem (Com pastas)
 
-    FS_START = 0x10000,
-    FS_HEADER_SIZE = 512,
+    FS_START = 0x10000, -- 64kb de memoria virtual
+    FS_HEADER_SIZE = 0x1000, -- 4kb para metadados
     File_types = {
         TXT = 0x01,
         LUA = 0x02,
         PNG = 0x03,
         WAV = 0x04,
+        F99 = 0x88  -- CART file
     },
 
     -- Componentes do sistema
@@ -60,6 +61,14 @@ vm = {
 local bit32 = require("libs/bit32")
 
 vm.filesystem = {
+    root = {
+        name = "",
+        type = "dir",
+        children = {},
+        parent   = nil,
+    },
+    current_dir = nil,
+    inode_counter = 1,
     entries = {},
     next_address = vm.FS_START + vm.FS_HEADER_SIZE,
 }
@@ -167,11 +176,7 @@ function vm:fs_update_header()
     vm.mem[vm.FS_START+6] = bit32.band(bit32.rshift(num_files,8),0xFF)
 end
 
--- =================================
--- ======== VM =====================
--- =================================
-
--- init the system!
+-- Inicialização do sistema
 function vm.init()
     vm.init_memory()
     vm.init_palette()
