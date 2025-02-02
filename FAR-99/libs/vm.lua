@@ -167,7 +167,11 @@ function vm:fs_update_header()
     vm.mem[vm.FS_START+6] = bit32.band(bit32.rshift(num_files,8),0xFF)
 end
 
--- Inicialização do sistema
+-- =================================
+-- ======== VM =====================
+-- =================================
+
+-- init the system!
 function vm.init()
     vm.init_memory()
     vm.init_palette()
