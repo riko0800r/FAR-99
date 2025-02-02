@@ -1,258 +1,250 @@
--- main.lua
-local bit32 = require("libs/bit32")
+--[[
+Estrutura do sistema de tracker na memória:
+0xA000 - Área de áudio
+  0xA000-0xA0FF: Canais (64 bytes por canal)
+    00: Status (0=inativo, 1=ativo)
+    01: Tipo de sample (0=waveform, 1=PCM)
+    02: Volume (0-15)
+    03: Volume atual
+    04: Nota atual
+    05: Efeito
+    06: Parâmetro do efeito
+    07: Ponteiro do sample (high byte)
+    08: Ponteiro do sample (low byte)
+    09: Tamanho do sample
+    0A: Loop point (high)
+    0B: Loop point (low)
+    0C: Posição atual (high)
+    0D: Posição atual (low)
+    0E: Velocidade de reprodução
+    0F: Contador de velocidade
+    
+0xB000 - Samples PCM (16KB)
+0xC000 - Padrões (64 padrões)
+  0xC000-0xC0FF: Cabeçalho
+  0xC100-0xCFFF: Dados dos padrões
 
--- Ampliar memória para 128KB total (96KB originais + 32KB extra)
-vm.mem_size = 0x20000
-vm.FS_START = 0x10000  -- 64KB para sistema de arquivos
-vm.CHUNK_SIZE = 512    -- Tamanho de alocação básico
+0xD000 - Tabela de ordens (256 bytes)
+0xD100 - Tabela de instrumentos (256 entradas)
+]]
 
--- Tipos de arquivo estendidos (0x00-0x7F reservados)
-vm.FILE_TYPES = {
-    SPRITE = 0x10,     -- Sprite 16x16 + metadados
-    TRACKER = 0x11,    -- Música tipo tracker
-    BITFONT = 0x12,    -- Fonte bitmap
-    VECTORFONT = 0x13, -- Fonte vetorial simplificada
-    MAP = 0x14,        -- Mapa de tiles
-    CONFIG = 0x15,     -- Arquivo de configuração
-    SCRIPT = 0x16      -- Código executável
+-- Configuração do tracker
+vm.tracker = {
+    tempo = 125,
+    speed = 6,
+    current_pattern = 0,
+    current_row = 0,
+    tick = 0,
+    order_pos = 0,
+    playing = false,
+    channels = {
+        { note = 0, instrument = 0, volume = 15, effect = 0, param = 0 },
+        { note = 0, instrument = 0, volume = 15, effect = 0, param = 0 },
+        { note = 0, instrument = 0, volume = 15, effect = 0, param = 0 },
+        { note = 0, instrument = 0, volume = 15, effect = 0, param = 0 }
+    }
 }
 
--- Sistema de arquivos melhorado
-vm.filesystem = {
-    fat = {},           -- File Allocation Table
-    entries = {},       -- Metadados
-    chunk_map = {},
-    next_chunk = 1
+-- Tipos de efeitos
+vm.FX = {
+    NONE      = 0x0,
+    SET_VOL   = 0xC,
+    PORTAMENTO= 0x3,
+    VIBRATO   = 0x4,
+    ARPEGGIO  = 0x8,
+    JUMP      = 0xB,
+    BREAK     = 0xD,
+    SPEED     = 0xF
 }
 
-function vm.fs_init()
-    -- Inicializar FAT
-    local total_chunks = (vm.mem_size - vm.FS_START) / vm.CHUNK_SIZE
-    for i = 1, total_chunks do
-        vm.filesystem.chunk_map[i] = false
+-- Inicialização do sistema
+function vm.init_tracker()
+    -- Configurar canais
+    for ch = 0, 3 do
+        local base = 0xA000 + (ch * 64)
+        vm.mem[base] = 0 -- Status
+        vm.mem[base+2] = 15 -- Volume
     end
     
-    -- Escrever assinatura do sistema
-    vm:fs_write(vm.FS_START, string.char(0x46, 0x53, 0x32, 0x30)) -- 'FS20'
+    -- Configurar instrumentos padrão
+    for i = 0, 15 do
+        vm.mem[0xD100 + i] = 0x80 + i -- Waveform básica + volume
+    end
 end
 
--- Sistema baseado em chunks
-function vm.fs_allocate(chunks)
-    local allocated = {}
-    for i = 1, #vm.filesystem.chunk_map do
-        if not vm.filesystem.chunk_map[i] then
-            table.insert(allocated, i)
-            if #allocated == chunks then
-                for _, c in ipairs(allocated) do
-                    vm.filesystem.chunk_map[c] = true
-                end
-                return allocated
-            end
+-- Processar uma linha do padrão
+function vm.process_tracker_row()
+    local pattern_addr = 0xC000 + (vm.tracker.current_pattern * 256)
+    local row_addr = pattern_addr + 16 + (vm.tracker.current_row * 16)
+    
+    for ch = 0, 3 do
+        local data = {
+            note = vm.mem[row_addr + (ch * 4)],
+            instr = vm.mem[row_addr + (ch * 4) + 1],
+            effect = vm.mem[row_addr + (ch * 4) + 2],
+            param = vm.mem[row_addr + (ch * 4) + 3]
+        }
+        
+        if data.note > 0 then
+            vm.play_note(ch, data.note, data.instr, data.effect, data.param)
+        else
+            vm.apply_effect(ch, data.effect, data.param)
         end
     end
-    return nil
 end
 
--- Formatos Especiais ---------------------------------------------------------
-
--- Sprite 16x16 (68 bytes)
-function vm.fs_create_sprite(name, pixels, paleta, anim)
-    local data = ""
-    -- Pixel data (256 nibbles compactados)
-    for i = 0, 255, 2 do
-        data = data .. string.char(
-            (pixels[i+1] << 4) | pixels[i+2]
-        )
-    end
-    -- Paleta (16 cores RGB332)
-    for _, c in ipairs(paleta) do
-        data = data .. string.char(
-            (c.r << 5) | (c.g << 2) | (c.b >> 1)
-        )
-    end
-    -- Animação (frames e velocidade)
-    data = data .. string.char(anim.frames)
-    data = data .. string.char(anim.speed)
+-- Tocar uma nota
+function vm.play_note(channel, note, instrument, effect, param)
+    local ch_base = 0xA000 + (channel * 64)
+    local freq = vm.note_to_freq(note)
+    local instr_addr = 0xD100 + instrument
     
-    return vm.fs_create(name, vm.FILE_TYPES.SPRITE, data)
+    -- Configurar instrumento
+    vm.mem[ch_base + 1] = vm.mem[instr_addr]    -- Tipo
+    vm.mem[ch_base + 2] = vm.mem[instr_addr + 1] -- Volume
+    
+    -- Configurar sample
+    if bit32.band(vm.mem[instr_addr], 0x80) ~= 0 then
+        local sample_id = bit32.band(vm.mem[instr_addr], 0x7F)
+        vm.mem[ch_base + 7] = bit32.rshift(0xB000 + (sample_id * 256), 8)
+        vm.mem[ch_base + 8] = bit32.band(0xB000 + (sample_id * 256), 0xFF)
+        vm.mem[ch_base + 9] = vm.mem[instr_addr + 2] -- Tamanho
+    end
+    
+    -- Configurar efeito
+    vm.mem[ch_base + 5] = effect
+    vm.mem[ch_base + 6] = param
+    
+    -- Ativar canal
+    vm.mem[ch_base] = 1
+    vm.tracker.channels[channel + 1].note = note
 end
 
--- Música Tracker (formato simplificado)
-function vm.fs_create_song(name, bpm, patterns, instruments)
-    local header = string.pack("<I2I1I1", bpm, #patterns, #instruments)
-    local data = header
+-- Aplicar efeito
+function vm.apply_effect(channel, effect, param)
+    local ch_base = 0xA000 + (channel * 64)
+    local ch = vm.tracker.channels[channel + 1]
     
-    -- Instrumentos (formato OPL2 simplificado)
-    for _, inst in ipairs(instruments) do
-        data = data .. string.pack("<I1I1I1I1I1",
-            inst.multiplier,
-            inst.attack,
-            inst.decay,
-            inst.sustain,
-            inst.release
-        )
+    if effect == vm.FX.SET_VOL then
+        vm.mem[ch_base + 2] = param
+    elseif effect == vm.FX.ARPEGGIO then
+        ch.param = param
+    elseif effect == vm.FX.PORTAMENTO then
+        -- Implementar portamento
     end
+end
+
+-- Atualização do áudio
+function vm.update_tracker(dt)
+    if not vm.tracker.playing then return end
     
-    -- Padrões musicais
-    for _, pattern in ipairs(patterns) do
-        data = data .. string.pack("B", pattern.length)
-        for _, note in ipairs(pattern.notes) do
-            data = data .. string.pack("<I2I1I1",
-                note.frequency,
-                note.instrument,
-                note.effect
-            )
+    vm.tracker.tick = vm.tracker.tick + 1
+    if vm.tracker.tick >= vm.tracker.speed then
+        vm.tracker.tick = 0
+        vm.tracker.current_row = vm.tracker.current_row + 1
+        
+        if vm.tracker.current_row >= 64 then
+            vm.tracker.current_row = 0
+            vm.tracker.order_pos = vm.tracker.order_pos + 1
+            vm.tracker.current_pattern = vm.mem[0xD000 + vm.tracker.order_pos]
         end
+        
+        vm.process_tracker_row()
     end
     
-    return vm.fs_create(name, vm.FILE_TYPES.TRACKER, data)
-end
-
--- Fonte Bitmap (8x8 pixels)
-function vm.fs_create_font(name, glyphs)
-    local data = ""
-    for i = 32, 127 do  -- ASCII básico
-        local g = glyphs[i] or glyphs[32]
-        for y = 1, 8 do
-            local byte = 0
-            for x = 1, 8 do
-                byte = byte | ((g[y][x] and 1 or 0) << (8 - x))
-            end
-            data = data .. string.char(byte)
-        end
+    -- Aplicar efeitos em tempo real
+    for ch = 0, 3 do
+        vm.process_effects(ch)
     end
-    return vm.fs_create(name, vm.FILE_TYPES.BITFONT, data)
 end
 
--- Sistema de Arquivos Genérico -------------------------------------------------
-function vm.fs_create(name, ftype, data)
-    local chunks_needed = math.ceil(#data / vm.CHUNK_SIZE)
-    local chunks = vm.fs_allocate(chunks_needed)
-    if not chunks then return false, "out_of_space" end
+-- Processar efeitos contínuos
+function vm.process_effects(channel)
+    local ch = vm.tracker.channels[channel + 1]
+    local ch_base = 0xA000 + (channel * 64)
     
-    local entry = {
-        name = name,
-        type = ftype,
-        chunks = chunks,
-        size = #data,
-        timestamp = os.time(),
-        address = vm.FS_START + (chunks[1]-1)*vm.CHUNK_SIZE
-    }
-    
-    -- Escrever dados
-    for i = 1, #data do
-        local addr = entry.address + i - 1
-        vm.mem[addr] = data:byte(i)
+    -- Arpeggio
+    if ch.effect == vm.FX.ARPEGGIO then
+        local notes = {
+            ch.note,
+            ch.note + bit32.rshift(ch.param, 4),
+            ch.note + bit32.band(ch.param, 0x0F)
+        }
+        local current = math.floor(vm.tracker.tick % 3)
+        vm.mem[ch_base + 4] = notes[current + 1]
     end
     
-    -- Atualizar FAT
-    vm.filesystem.entries[name] = entry
-    vm:fs_update_fat()
-    return true
-end
-
-function vm.fs_read(name)
-    local entry = vm.filesystem.entries[name]
-    if not entry then return nil end
-    
-    local data = ""
-    for addr = entry.address, entry.address + entry.size - 1 do
-        data = data .. string.char(vm.mem[addr])
+    -- Vibrato
+    if ch.effect == vm.FX.VIBRATO then
+        local depth = bit32.rshift(ch.param, 4)
+        local speed = bit32.band(ch.param, 0x0F)
+        local mod = math.sin(vm.tracker.tick * speed) * depth
+        vm.mem[ch_base + 4] = ch.note + mod
     end
-    
-    return {
-        type = entry.type,
-        data = data,
-        size = entry.size,
-        created = entry.timestamp
-    }
 end
 
--- API de Alto Nível -----------------------------------------------------------
+-- API para o jogo
 function vm.expose_api()
     return {
-        -- Sistema de Arquivos
-        fs = {
-            create = vm.fs_create,
-            read = vm.fs_read,
-            delete = function(name)
-                -- Implementação similar à anterior
-            end,
-            list = function() return vm.filesystem.entries end,
-            
-            -- Formatos Especiais
-            create_sprite = vm.fs_create_sprite,
-            create_song = vm.fs_create_song,
-            create_font = vm.fs_create_font,
-            
-            -- Conversores
-            import_ttf = function(name, ttf_data, size)
-                -- Converte TTF para bitmap font
-                local img = love.image.newImageData(128, 128)
-                -- [...] Processamento complexo
-                return vm.fs_create_font(name, processed_glyphs)
-            end,
-            
-            import_audio = function(name, wav_data)
-                -- Converte para formato tracker
-                -- [...] Análise do áudio
-                return vm.fs_create_song(name, converted_data)
-            end
-        },
-        
-        -- Player de Música
         music = {
-            play = function(name)
-                local song = vm.fs_read(name)
-                if song.type == vm.FILE_TYPES.TRACKER then
-                    -- Interpretar formato tracker
-                end
-            end
-        },
-        
-        -- Sistema de Fontes
-        font = {
-            load = function(name)
-                local f = vm.fs_read(name)
-                if f.type == vm.FILE_TYPES.BITFONT then
-                    return vm.font_create(f.data)
+            play = function(pattern)
+                vm.tracker.current_pattern = pattern
+                vm.tracker.playing = true
+            end,
+            stop = function()
+                vm.tracker.playing = false
+            end,
+            set_tempo = function(tempo)
+                vm.tracker.speed = math.floor(150 / tempo)
+            end,
+            
+            -- Criar instrumento
+            create_instrument = function(id, type, vol, sample)
+                local addr = 0xD100 + id
+                vm.mem[addr] = bit32.bor(type, bit32.lshift(vol, 4))
+                vm.mem[addr + 1] = sample
+            end,
+            
+            -- Criar padrão
+            create_pattern = function(id, data)
+                local addr = 0xC000 + (id * 256)
+                for i = 1, #data do
+                    vm.mem[addr + i - 1] = data[i]
                 end
             end
         }
     }
 end
 
--- Exemplos de Uso -------------------------------------------------------------
---[[
--- Criar sprite
-local pal = {
-    {r=0, g=0, b=0},    -- Preto
-    {r=7, g=7, b=7},    -- Branco
-    -- ... 14 cores ...
-}
-local pixels = {0,1,1,0,...} -- 256 valores (0-15)
-fs.create_sprite("hero", pixels, pal, {frames=4, speed=10})
+-- Função de conversão nota-frequência
+function vm.note_to_freq(note)
+    return 440 * math.pow(2, (note - 69) / 12)
+end
 
--- Criar música
-local instruments = {
-    { multiplier=1, attack=5, decay=3, sustain=15, release=5 }
-}
-local patterns = {
-    {
-        length = 16,
-        notes = {
-            {frequency=440, instrument=1, effect=0},
-            -- ... 15 notas ...
-        }
-    }
-}
-fs.create_song("theme", 120, patterns, instruments)
+-- Mixador de áudio
+function vm.tracker_mixer()
+    local mix = 0
+    for ch = 0, 3 do
+        local ch_base = 0xA000 + (ch * 64)
+        if vm.mem[ch_base] == 1 then
+            local sample_pos = bit32.lshift(vm.mem[ch_base + 0xC], 8) + vm.mem[ch_base + 0xD]
+            local sample = vm.mem[0xB000 + sample_pos]
+            mix = mix + (sample * vm.mem[ch_base + 2]) / 64
+        end
+    end
+    return vm.clamp(mix, -1, 1)
+end
 
--- Criar fonte
-local glyphs = {
-    [32] = {{0,0,0,0,0,0,0,0}, ...}, -- Espaço
-    [65] = {{0,1,1,0,1,1,1,0}, ...}, -- A
-    -- ... outros glifos ...
-}
-fs.create_font("pixel_font", glyphs)
-]]
+-- Modificar a função update_audio
+function vm.update_audio(dt)
+    vm.update_tracker(dt)
+    
+    local samples_needed = vm.audio.source:getFreeBufferCount() * 4096
+    local sample_data = love.sound.newSoundData(samples_needed, 44100, 16, 1)
+    
+    for i = 0, samples_needed - 1 do
+        sample_data:setSample(i, vm.tracker_mixer())
+    end
+    
+    vm.audio.source:queue(sample_data)
+end
