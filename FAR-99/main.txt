@@ -1,0 +1,199 @@
+local bit = require("bit32")
+local band, bor, bxor = bit.band, bit.bor, bit.bxor
+
+local vm = {
+    -- Configurações do sistema
+    screen_width = 256,
+    screen_height = 224,
+    mem_size = 0x10000,  -- 64KB
+    cpu_speed = 5.37e6,  -- ~5.37 MHz (SNES)
+    
+    -- Endereços de memória
+    ADDR_ROM = 0x0000,
+    ADDR_VRAM = 0x8000,
+    ADDR_PALETTE = 0x4000,
+    ADDR_OAM = 0x4400,
+    ADDR_IO = 0x2100,
+    ADDR_DISK = 0x6000,  -- Sistema de arquivos virtual (8KB)
+    
+    -- Componentes
+    mem = {},
+    palette = {},
+    input = 0,
+    cpu = {
+        pc = 0xFFFC,
+        sp = 0x01FF,
+        a = 0, x = 0, y = 0,
+        status = {
+            carry = false,
+            zero = false,
+            interrupt = true,
+            decimal = false,
+            overflow = false,
+            negative = false
+        }
+    },
+    
+    -- Sistema de arquivos virtual
+    fs = {
+        sector_size = 512,
+        fat = {}
+    }
+}
+
+--[[ CPU 16-bit inspirada no 65C816 (SNES) ]]
+function vm.init_cpu()
+    local cpu = vm.cpu
+    cpu.opcodes = {
+        [0xA9] = function() -- LDA #imm
+            cpu.a = vm.mem_read16(cpu.pc)
+            cpu.pc = cpu.pc + 2
+            cpu.status.zero = (cpu.a == 0)
+            cpu.status.negative = (cpu.a >= 0x8000)
+        end,
+        
+        [0x8D] = function() -- STA abs
+            local addr = vm.mem_read16(cpu.pc)
+            vm.mem_write16(addr, cpu.a)
+            cpu.pc = cpu.pc + 2
+        end,
+        
+        [0x6D] = function() -- ADC abs
+            local addr = vm.mem_read16(cpu.pc)
+            local value = vm.mem_read16(addr)
+            local result = cpu.a + value + (cpu.status.carry and 1 or 0)
+            
+            cpu.status.carry = result > 0xFFFF
+            cpu.status.overflow = (bxor(cpu.a, result) & bxor(value, result)) & 0x8000 ~= 0
+            cpu.a = band(result, 0xFFFF)
+            cpu.status.zero = (cpu.a == 0)
+            cpu.status.negative = (cpu.a >= 0x8000)
+            
+            cpu.pc = cpu.pc + 2
+        end
+    }
+end
+
+function vm.mem_read16(addr)
+    addr = band(addr, 0xFFFF)
+    return bor(vm.mem[addr+1] or 0, lshift(vm.mem[addr] or 0, 8))
+end
+
+function vm.mem_write16(addr, value)
+    addr = band(addr, 0xFFFF)
+    vm.mem[addr] = band(rshift(value, 8), 0xFF)
+    vm.mem[addr+1] = band(value, 0xFF)
+end
+
+function vm.cpu_step()
+    local cpu = vm.cpu
+    local opcode = vm.mem[cpu.pc]
+    cpu.pc = cpu.pc + 1
+    
+    if cpu.opcodes[opcode] then
+        cpu.opcodes[opcode]()
+    else
+        error("Opcode não implementado: 0x"..string.format("%02X", opcode))
+    end
+end
+
+--[[ Sistema de Arquivos Virtual ]]
+function vm.fs_load(filename, addr)
+    local data = love.filesystem.read(filename, "raw")
+    addr = addr or vm.ADDR_DISK
+    
+    for i = 1, #data do
+        vm.mem[addr + i - 1] = string.byte(data:sub(i,i))
+    end
+end
+
+function vm.fs_save(filename, size, addr)
+    addr = addr or vm.ADDR_DISK
+    size = size or vm.fs.sector_size
+    local data = ""
+    
+    for i = addr, addr + size - 1 do
+        data = data .. string.char(vm.mem[i] or 0)
+    end
+    
+    love.filesystem.write(filename, data)
+end
+
+--[[ Sistema de Vídeo Otimizado ]]
+function vm.init_ppu()
+    vm.tileset = love.graphics.newImage("tileset.png")
+    vm.tilemap = {}
+    
+    -- Configura camadas de tiles
+    for i = 0, 3 do
+        vm.tilemap[i] = {
+            map = {},
+            scroll_x = 0,
+            scroll_y = 0
+        }
+    end
+end
+
+function vm.draw_tile(layer, x, y, tile)
+    local tx = band(tile, 0xFF) * 8
+    local ty = band(rshift(tile, 8), 0xFF) * 8
+    love.graphics.draw(vm.tileset, love.graphics.newQuad(tx, ty, 8, 8, 1024, 1024),
+        x * 8 + vm.tilemap[layer].scroll_x, 
+        y * 8 + vm.tilemap[layer].scroll_y)
+end
+
+--[[ API para Jogos ]]
+function vm.expose_api()
+    return {
+        -- Controle CPU
+        cpu_step = vm.cpu_step,
+        mem_read = function(addr) return vm.mem[addr] end,
+        mem_write = function(addr, val) vm.mem[addr] = band(val, 0xFF) end,
+        
+        -- Gráficos
+        set_pixel = function(x, y, color)
+            if x >= 0 and x < 256 and y >= 0 and y < 224 then
+                vm.mem[vm.ADDR_VRAM + y * 256 + x] = band(color, 0xFF)
+            end
+        end,
+        
+        -- Sistema de Arquivos
+        fs_load = vm.fs_load,
+        fs_save = vm.fs_save,
+        
+        -- Controles
+        btn = function(mask)
+            return band(vm.input, mask) ~= 0
+        end
+    }
+end
+
+--[[ Loop Principal ]]
+function love.load()
+    vm.init_cpu()
+    vm.init_ppu()
+    
+    -- Carrega o jogo
+    local api = vm.expose_api()
+    local game = love.filesystem.load("game.lua")
+    setfenv(game, setmetatable(api, {__index = _G}))
+    game()
+end
+
+function love.update(dt)
+    -- Executa ~90.000 ciclos por frame (para 60 FPS)
+    for i = 1, vm.cpu_speed / 60 do
+        vm.cpu_step()
+    end
+end
+
+function love.draw()
+    -- Renderização baseada em VRAM
+    for y = 0, 223 do
+        for x = 0, 255 do
+            local color = vm.mem[vm.ADDR_VRAM + y * 256 + x]
+            love.graphics.setColor(vm.palette[color])
+            love.graphics.points(x, y)
+        end
+    end
+end
