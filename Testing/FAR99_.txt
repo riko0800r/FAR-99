@@ -1,0 +1,31 @@
+function love.load()
+    -- Criar instrumento de onda quadrada
+    music.create_instrument(0, 0, 15, 0)
+    
+    -- Criar sample de bateria
+    local drum_sample = {}
+    for i = 1, 256 do
+        drum_sample[i] = math.random(-128, 127)
+    end
+    fs.create("drum1", "SAMPLE", string.char(unpack(drum_sample)))
+    
+    -- Criar padrão
+    local pattern_data = {
+        -- Canal 1: Nota C-4 com arpeggio
+        0x24, 0x00, 0x08, 0x34,  -- Nota, Instr, Efeito, Param
+        
+        -- Canal 2: Nota E-4 com vibrato
+        0x28, 0x00, 0x04, 0x44,
+        
+        -- Canal 3: Nota G-4
+        0x2C, 0x00, 0x00, 0x00,
+        
+        -- Canal 4: Bateria
+        0xFF, 0x01, 0x00, 0x00
+    }
+    music.create_pattern(0, pattern_data)
+    
+    -- Tocar música
+    music.play(0)
+    music.set_tempo(125)
+end
