@@ -1,31 +1,135 @@
-function love.load()
-    -- Criar instrumento de onda quadrada
-    music.create_instrument(0, 0, 15, 0)
+vm.FILE_TYPES.FONT = 0x05  -- Adicionar tipo de arquivo FONT
+
+function vm.load_font(name)
+    local file = vm.fs_read(name)
+    if not file or file.type ~= vm.FILE_TYPES.FONT then return false end
     
-    -- Criar sample de bateria
-    local drum_sample = {}
-    for i = 1, 256 do
-        drum_sample[i] = math.random(-128, 127)
-    end
-    fs.create("drum1", "SAMPLE", string.char(unpack(drum_sample)))
-    
-    -- Criar padrão
-    local pattern_data = {
-        -- Canal 1: Nota C-4 com arpeggio
-        0x24, 0x00, 0x08, 0x34,  -- Nota, Instr, Efeito, Param
-        
-        -- Canal 2: Nota E-4 com vibrato
-        0x28, 0x00, 0x04, 0x44,
-        
-        -- Canal 3: Nota G-4
-        0x2C, 0x00, 0x00, 0x00,
-        
-        -- Canal 4: Bateria
-        0xFF, 0x01, 0x00, 0x00
+    -- Decodificar fonte bitmap (formato próprio)
+    vm.fonts[name] = {
+        chars = {},
+        height = 8,
+        spacing = 1
     }
-    music.create_pattern(0, pattern_data)
     
-    -- Tocar música
-    music.play(0)
-    music.set_tempo(125)
+    local data = file.data
+    local pos = 1
+    local char_count = data:byte(pos) pos = pos + 1
+    
+    for i = 1, char_count do
+        local char = string.char(data:byte(pos)) pos = pos + 1
+        local width = data:byte(pos) pos = pos + 1
+        local bytes_per_row = math.ceil(width / 8)
+        
+        vm.fonts[name].chars[char] = {
+            width = width,
+            bitmap = {}
+        }
+        
+        -- Decodificar bitmap
+        for row = 1, vm.fonts[name].height do
+            local byte_row = {}
+            for b = 1, bytes_per_row do
+                byte_row[b] = data:byte(pos) pos = pos + 1
+            end
+            vm.fonts[name].chars[char].bitmap[row] = byte_row
+        end
+    end
+    
+    return true
+end
+
+function vm.print_text(x, y, text, font_name, color)
+    local font = vm.fonts[font_name or "default"]
+    if not font then return end
+    
+    color = color or 15
+    local cursor_x = x
+    local cursor_y = y
+    
+    for c in text:gmatch(".") do
+        if c == "\n" then
+            cursor_x = x
+            cursor_y = cursor_y + font.height + font.spacing
+        else
+            local char = font.chars[c]
+            if char then
+                -- Renderizar cada pixel do caractere
+                for row = 1, font.height do
+                    for byte_idx, byte in ipairs(char.bitmap[row]) do
+                        for bit = 7, 0, -1 do
+                            local mask = 2^bit
+                            if (byte & mask) == mask then
+                                local px_x = cursor_x + ((byte_idx-1)*8) + (7 - bit)
+                                if px_x < cursor_x + char.width then
+                                    vm.px(px_x, cursor_y + row - 1, color)
+                                end
+                            end
+                        end
+                    end
+                end
+                cursor_x = cursor_x + char.width + font.spacing
+            end
+        end
+    end
+end
+
+-- Conversor de fonte .ttf/.otf para formato bitmap
+function vm.font_to_bitmap(otf_path, size)
+    local font_data = love.filesystem.read(otf_path)
+    local temp_font = love.filesystem.newFileData(font_data, "temp_font.otf")
+    local font = love.graphics.newFont(temp_font, size)
+    
+    local output = {string.char(0)}  -- Char count (será atualizado)
+    local chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    
+    for i = 1, #chars do
+        local c = chars:sub(i,i)
+        local glyph = love.graphics.newText(font, c)
+        local img_data = glyph:getImageData()
+        
+        -- Converter imagem para bitmap
+        local width = img_data:getWidth()
+        local height = img_data:getHeight()
+        local bitmap = {}
+        
+        -- Processar cada linha
+        for y = 0, height-1 do
+            local byte_row = {}
+            local byte = 0
+            local bit_pos = 7
+            
+            for x = 0, width-1 do
+                local r, g, b, a = img_data:getPixel(x, y)
+                if a > 0.5 then  -- Pixel visível
+                    byte = byte | (1 << bit_pos)
+                end
+                
+                bit_pos = bit_pos - 1
+                if bit_pos < 0 then
+                    table.insert(byte_row, byte)
+                    byte = 0
+                    bit_pos = 7
+                end
+            end
+            
+            if bit_pos ~= 7 then
+                table.insert(byte_row, byte)
+            end
+            table.insert(bitmap, byte_row)
+        end
+        
+        -- Adicionar ao output
+        output[1] = string.char(output[1]:byte() + 1)  -- Incrementar contador
+        table.insert(output, c)                        -- Caractere
+        table.insert(output, string.char(width))       -- Largura
+        
+        -- Dados do bitmap
+        for _, row in ipairs(bitmap) do
+            for _, byte in ipairs(row) do
+                table.insert(output, string.char(byte))
+            end
+        end
+    end
+    
+    return table.concat(output)
 end
